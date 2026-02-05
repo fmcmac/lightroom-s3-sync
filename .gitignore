@@ -2,4 +2,4 @@
 __pycache__/
 *.pyc
 AWSCLIV2.pkg
-d_drive_backup_log_*.txt
+lightroom_s3_sync_*.log

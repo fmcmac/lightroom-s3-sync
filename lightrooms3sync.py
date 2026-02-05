@@ -1,10 +1,9 @@
 """
-This script scans a D drive directory and all subdirectories, verifies each file exists in S3,
-and uploads any missing files. Designed for comprehensive backup verification with performance
-optimization, detailed logging, and progress tracking.
+Syncs a local Lightroom photo directory to S3. Recursively scans a source directory,
+checks which files already exist in S3, and uploads any missing files.
 
 Usage:
-    python d_drive_backup_verifier.py [--source-path "D:\\Pictures\\Lightroom"] [--threads 4] [--dry-run]
+    lightroom-s3-sync --source-path "/path/to/photos" [--threads 4] [--dry-run]
 """
 
 import os
@@ -343,12 +342,12 @@ def format_bytes(bytes_count: int) -> str:
         bytes_count /= 1024.0
     return f"{bytes_count:.1f} PB"
 
-def verify_d_drive_backup(source_path: str, s3_bucket: str, s3_prefix: str, 
-                         log_file: str, max_workers: int = 4, batch_size: int = 100,
-                         dry_run: bool = False) -> BackupStats:
+def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
+               log_file: str, max_workers: int = 4, batch_size: int = 100,
+               dry_run: bool = False) -> BackupStats:
     """
-    Main function to verify D drive backup to S3.
-    
+    Sync a local directory to S3, uploading any files not already present.
+
     Args:
         source_path: Source directory path to scan
         s3_bucket: S3 bucket name
@@ -357,7 +356,7 @@ def verify_d_drive_backup(source_path: str, s3_bucket: str, s3_prefix: str,
         max_workers: Maximum number of worker threads
         batch_size: Batch size for processing files
         dry_run: If True, only simulate uploads without actually uploading
-    
+
     Returns:
         BackupStats: Summary statistics
     """
@@ -383,7 +382,7 @@ def verify_d_drive_backup(source_path: str, s3_bucket: str, s3_prefix: str,
     if dry_run:
         logging.info("*** DRY RUN MODE - No files will be uploaded ***")
     
-    logging.info("Starting D drive backup verification...")
+    logging.info("Starting sync...")
     logging.info(f"Source: {source_path}")
     logging.info(f"S3 Bucket: {s3_bucket}")
     logging.info(f"S3 Prefix: {s3_prefix}")
@@ -448,7 +447,7 @@ def verify_d_drive_backup(source_path: str, s3_bucket: str, s3_prefix: str,
     print()  # New line after progress
     
     # Log final statistics
-    logging.info("===== D Drive Backup Verification Summary =====")
+    logging.info("===== Sync Summary =====")
     logging.info(f"Total files scanned: {total_stats.total_files_scanned:,}")
     logging.info(f"Files already in S3: {total_stats.files_already_in_s3:,}")
     logging.info(f"Files uploaded to S3: {total_stats.files_uploaded_to_s3:,}")
@@ -459,18 +458,18 @@ def verify_d_drive_backup(source_path: str, s3_bucket: str, s3_prefix: str,
     if dry_run:
         logging.info("*** This was a DRY RUN - no files were actually uploaded ***")
     
-    logging.info("D drive backup verification complete.")
+    logging.info("Sync complete.")
     
     return total_stats
 
 def main():
     """Main entry point with command-line argument parsing."""
     parser = argparse.ArgumentParser(
-        description="D Drive Backup Verification Tool - Scans D drive and ensures all files are backed up to S3",
+        description="Sync a local Lightroom photo directory to S3",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--source-path', type=str, default=r"D:\Pictures\Lightroom",
-                       help='Source directory to scan for backup verification')
+    parser.add_argument('--source-path', type=str, required=True,
+                       help='Source directory to scan and sync to S3')
     parser.add_argument('--s3-bucket', type=str, default="mcmac.store",
                        help='S3 bucket name for backup storage')
     parser.add_argument('--s3-prefix', type=str, default="Pictures/Lightroom",
@@ -488,20 +487,20 @@ def main():
     
     # Generate log file with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = f"d_drive_backup_log_{timestamp}.txt"
+    log_file = f"lightroom_s3_sync_{timestamp}.log"
     
     try:
         if args.dry_run:
             print("DRY RUN MODE - No files will be uploaded")
-        
-        print(f"D Drive Backup Verification Tool")
+
+        print(f"Lightroom S3 Sync")
         print(f"Source: {args.source_path}")
         print(f"S3 Bucket: s3://{args.s3_bucket}/{args.s3_prefix}")
         print(f"Log file: {log_file}")
         print("-" * 50)
         
         # Run the backup verification process
-        stats = verify_d_drive_backup(
+        stats = sync_to_s3(
             args.source_path, args.s3_bucket, args.s3_prefix, log_file,
             max_workers=args.threads, batch_size=args.batch_size, dry_run=args.dry_run
         )

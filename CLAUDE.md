@@ -4,25 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Single-file Python tool (`lightrooms3sync.py`) that syncs a local Lightroom photo directory to an S3 bucket. It recursively scans a source directory, checks which files already exist in S3, and uploads any missing files. Designed primarily for Windows (includes sleep prevention) but runs cross-platform.
+Single-file Python tool (`lightrooms3sync.py`) that syncs a local Lightroom photo directory to an S3 bucket. It recursively scans a source directory, checks which files already exist in S3, and uploads any missing files. Runs cross-platform (macOS, Linux, Windows).
+
+## Setup
+
+```bash
+# Install dependencies and create venv (requires uv)
+uv sync
+```
 
 ## Running
 
 ```bash
-# Activate the venv (managed by uv, Python 3.13)
-source .venv/bin/activate
-
-# Basic run (uses defaults: D:\Pictures\Lightroom -> s3://mcmac.store/Pictures/Lightroom)
-python lightrooms3sync.py
+# Basic run (--source-path is required)
+uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom
 
 # Dry run to see what would be uploaded
-python lightrooms3sync.py --dry-run
+uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom --dry-run
 
-# Custom source path and threading
-python lightrooms3sync.py --source-path "/path/to/photos" --s3-bucket mybucket --s3-prefix "Photos" --threads 8 --batch-size 200
+# Custom bucket, prefix, and threading
+uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom --s3-bucket mybucket --s3-prefix "Photos" --threads 8 --batch-size 200
 ```
 
-Requires AWS credentials configured via `aws configure` or environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). The only external dependency is `boto3`.
+Requires AWS credentials configured via `aws configure` or environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
 
 ## Architecture
 
@@ -33,11 +37,11 @@ All code lives in `lightrooms3sync.py` with four main classes:
 - **BackupVerifier** — Orchestrates batch file processing: checks S3 existence then uploads missing files (or simulates in dry-run mode)
 - **ProgressTracker** — Thread-safe progress display with ETA calculation
 
-The `verify_d_drive_backup()` function wires these together: scan files, split into batches, process batches in parallel via `ThreadPoolExecutor`, aggregate `BackupStats` results.
+The `sync_to_s3()` function wires these together: scan files, split into batches, process batches in parallel via `ThreadPoolExecutor`, aggregate `BackupStats` results.
 
 ## Key Details
 
 - S3 keys are formed as `{s3_prefix}/{relative_path}` with backslashes converted to forward slashes
 - Uploads use exponential backoff retry (3 attempts)
-- No `requirements.txt` or `pyproject.toml` exists; `boto3` is the sole dependency
+- Managed with `uv`; dependencies defined in `pyproject.toml`, locked in `uv.lock`
 - No tests exist currently
