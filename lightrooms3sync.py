@@ -11,29 +11,43 @@ import logging
 import sys
 from pathlib import Path
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, NoCredentialsError
 from datetime import datetime
-import ctypes  # For preventing sleep on Windows
 import argparse
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Dict, Set, Optional
+from typing import List, Tuple, Dict
 import time
 from dataclasses import dataclass
 import threading
-from functools import lru_cache
+import fnmatch
+import subprocess
 
-# Prevent Windows sleep at script startup (Windows only)
-if sys.platform == "win32":
-    try:
+@contextmanager
+def prevent_sleep():
+    """Prevent the system from sleeping during long-running sync operations."""
+    if sys.platform == "darwin":
+        proc = subprocess.Popen(["caffeinate", "-s"])
+        try:
+            yield
+        finally:
+            proc.terminate()
+            proc.wait()
+    elif sys.platform == "win32":
+        import ctypes
         ES_CONTINUOUS = 0x80000000
         ES_SYSTEM_REQUIRED = 0x00000001
-        ES_AWAYMODE_REQUIRED = 0x00000040
-        
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
-        )
-    except Exception:
-        pass  # Ignore if unable to prevent sleep
+        try:
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+            )
+            yield
+        finally:
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    else:
+        yield
+
 
 @dataclass
 class BackupStats:
@@ -58,18 +72,22 @@ class BackupStats:
 
 class S3BackupManager:
     """Optimized S3 operations for backup verification and upload."""
-    
-    def __init__(self, max_pool_connections: int = 50):
+
+    def __init__(self, max_pool_connections: int = 50, endpoint_url: str = None):
         self.s3_client = None
         self._s3_cache: Dict[str, bool] = {}
         self._cache_lock = threading.Lock()
         self.max_pool_connections = max_pool_connections
+        self.endpoint_url = endpoint_url
         self._initialize_client()
-    
+
     def _initialize_client(self):
         """Initialize S3 client with optimized configuration."""
         try:
-            self.s3_client = boto3.client('s3')
+            config = BotoConfig(max_pool_connections=self.max_pool_connections)
+            self.s3_client = boto3.client(
+                's3', config=config, endpoint_url=self.endpoint_url
+            )
             
             # Test basic connectivity
             response = self.s3_client.list_buckets()
@@ -123,29 +141,32 @@ class S3BackupManager:
             logging.error(f"Error type: {type(e).__name__}")
             return False
     
-    @lru_cache(maxsize=10000)
-    def file_exists(self, bucket: str, key: str) -> bool:
-        """Check if file exists in S3 with caching."""
+    def file_exists(self, bucket: str, key: str) -> Tuple[bool, int]:
+        """Check if file exists in S3 with thread-safe caching.
+
+        Returns:
+            (exists, size) — size is the S3 object size in bytes, or 0 if not found.
+        """
         cache_key = f"{bucket}/{key}"
-        
+
         with self._cache_lock:
             if cache_key in self._s3_cache:
                 return self._s3_cache[cache_key]
-        
+
         try:
-            self.s3_client.head_object(Bucket=bucket, Key=key)
-            exists = True
+            response = self.s3_client.head_object(Bucket=bucket, Key=key)
+            result = (True, response['ContentLength'])
         except ClientError as e:
             if e.response['Error']['Code'] == "404":
-                exists = False
+                result = (False, 0)
             else:
                 logging.warning(f"Error checking S3 object {key}: {e}")
-                exists = False
-        
+                result = (False, 0)
+
         with self._cache_lock:
-            self._s3_cache[cache_key] = exists
-        
-        return exists
+            self._s3_cache[cache_key] = result
+
+        return result
     
     def upload_file(self, bucket: str, key: str, src_file: Path) -> Tuple[bool, int]:
         """Upload file to S3 with retry logic. Returns (success, bytes_uploaded)."""
@@ -178,10 +199,14 @@ class S3BackupManager:
         
         return False, 0
     
-    def batch_check_exists(self, bucket: str, keys: List[str]) -> Dict[str, bool]:
-        """Batch check existence of multiple S3 objects."""
+    def batch_check_exists(self, bucket: str, keys: List[str]) -> Dict[str, Tuple[bool, int]]:
+        """Batch check existence of multiple S3 objects.
+
+        Returns:
+            Dict mapping key -> (exists, size_in_bytes).
+        """
         results = {}
-        
+
         # Check cache first
         uncached_keys = []
         with self._cache_lock:
@@ -191,33 +216,40 @@ class S3BackupManager:
                     results[key] = self._s3_cache[cache_key]
                 else:
                     uncached_keys.append(key)
-        
+
         # Check uncached keys
         for key in uncached_keys:
-            exists = self.file_exists(bucket, key)
-            results[key] = exists
-        
+            results[key] = self.file_exists(bucket, key)
+
         return results
 
 class FileScanner:
     """Handles recursive file scanning with error handling."""
-    
-    def __init__(self, source_root: Path):
+
+    def __init__(self, source_root: Path, exclude_patterns: List[str] = None):
         self.source_root = source_root
-    
+        self.exclude_patterns = exclude_patterns or []
+
+    def _is_excluded(self, filename: str) -> bool:
+        """Check if a filename matches any exclude pattern."""
+        return any(fnmatch.fnmatch(filename, pat) for pat in self.exclude_patterns)
+
     def scan_directory(self, directory: Path) -> List[Tuple[Path, str]]:
         """Scan directory recursively and return list of (file_path, relative_path) tuples."""
         files = []
-        
+
         try:
             if not directory.exists():
                 logging.error(f"Directory does not exist: {directory}")
                 return files
-            
+
             for root, dirs, filenames in os.walk(directory):
                 root_path = Path(root)
-                
+
                 for filename in filenames:
+                    if self._is_excluded(filename):
+                        logging.debug(f"Excluded: {filename}")
+                        continue
                     try:
                         file_path = root_path / filename
                         if file_path.is_file():
@@ -226,10 +258,10 @@ class FileScanner:
                     except Exception as e:
                         logging.warning(f"Error processing file {filename} in {root}: {e}")
                         continue
-                        
+
         except Exception as e:
             logging.error(f"Error scanning directory {directory}: {e}")
-        
+
         return files
     
     def get_all_files(self) -> List[Tuple[Path, str]]:
@@ -270,26 +302,33 @@ class BackupVerifier:
         # Process each file
         for s3_key in s3_keys:
             file_path, relative_path = file_mapping[s3_key]
-            
+
             try:
-                if s3_exists_map.get(s3_key, False):
+                s3_exists, s3_size = s3_exists_map.get(s3_key, (False, 0))
+                local_size = file_path.stat().st_size
+
+                if s3_exists and s3_size == local_size:
                     stats.files_already_in_s3 += 1
                     logging.debug(f"File already in S3: {relative_path}")
                 else:
-                    # File missing from S3, upload it
+                    if s3_exists:
+                        reason = f"size mismatch (local={local_size}, s3={s3_size})"
+                    else:
+                        reason = "missing from S3"
+
                     if self.dry_run:
-                        logging.info(f"[DRY RUN] Would upload: {relative_path}")
+                        logging.info(f"[DRY RUN] Would upload ({reason}): {relative_path}")
                         stats.files_uploaded_to_s3 += 1
                     else:
-                        logging.info(f"Uploading to S3: {relative_path}")
+                        logging.info(f"Uploading ({reason}): {relative_path}")
                         success, bytes_uploaded = self.s3_manager.upload_file(bucket, s3_key, file_path)
-                        
+
                         if success:
                             stats.files_uploaded_to_s3 += 1
                             stats.total_bytes_uploaded += bytes_uploaded
                         else:
                             stats.upload_failures += 1
-                            
+
             except Exception as e:
                 logging.error(f"Error processing file {relative_path}: {e}")
                 stats.scan_errors += 1
@@ -344,7 +383,9 @@ def format_bytes(bytes_count: int) -> str:
 
 def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
                log_file: str, max_workers: int = 4, batch_size: int = 100,
-               dry_run: bool = False) -> BackupStats:
+               dry_run: bool = False, debug: bool = False,
+               endpoint_url: str = None,
+               exclude_patterns: List[str] = None) -> BackupStats:
     """
     Sync a local directory to S3, uploading any files not already present.
 
@@ -363,19 +404,27 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
     # Configure logging with separate levels for file and console
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
-    
+
+    # Clear any existing handlers to prevent accumulation across calls
+    logger.handlers.clear()
+
     # File handler - detailed logging
     file_handler = logging.FileHandler(log_file, mode="w")
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     file_handler.setFormatter(file_formatter)
-    
-    # Console handler - less verbose
+
+    # Console handler - verbosity depends on flags
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.WARNING if not dry_run else logging.INFO)
+    if debug:
+        console_handler.setLevel(logging.DEBUG)
+    elif dry_run:
+        console_handler.setLevel(logging.INFO)
+    else:
+        console_handler.setLevel(logging.WARNING)
     console_formatter = logging.Formatter("%(message)s")
     console_handler.setFormatter(console_formatter)
-    
+
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
@@ -396,13 +445,15 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
         raise ValueError(f"Source directory does not exist: {source_path}")
     
     # Initialize components
-    s3_manager = S3BackupManager(max_pool_connections=max_workers * 2)
+    s3_manager = S3BackupManager(
+        max_pool_connections=max_workers * 2, endpoint_url=endpoint_url
+    )
     
     # Validate S3 bucket exists and is accessible
     if not s3_manager.validate_bucket(s3_bucket):
         raise ValueError(f"S3 bucket validation failed: {s3_bucket}")
     
-    scanner = FileScanner(source_root)
+    scanner = FileScanner(source_root, exclude_patterns=exclude_patterns)
     verifier = BackupVerifier(s3_manager, dry_run)
     
     # Scan all files
@@ -478,6 +529,12 @@ def main():
                        help='Number of worker threads for parallel processing')
     parser.add_argument('--batch-size', type=int, default=100,
                        help='Number of files to process in each batch')
+    parser.add_argument('--exclude', action='append', default=[], metavar='PATTERN',
+                       help='Exclude files matching this glob pattern (repeatable, e.g. --exclude "*.lrdata" --exclude ".DS_Store")')
+    parser.add_argument('--log-file', type=str, default=None,
+                       help='Log file path (default: lightroom_s3_sync_<timestamp>.log)')
+    parser.add_argument('--endpoint-url', type=str, default=None,
+                       help='Custom S3 endpoint URL for S3-compatible services (e.g. MinIO, Backblaze B2)')
     parser.add_argument('--dry-run', action='store_true',
                        help='Perform a dry run without uploading files (shows what would be uploaded)')
     parser.add_argument('--debug', action='store_true',
@@ -485,59 +542,55 @@ def main():
     
     args = parser.parse_args()
     
-    # Generate log file with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = f"lightroom_s3_sync_{timestamp}.log"
+    if args.log_file:
+        log_file = args.log_file
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = f"lightroom_s3_sync_{timestamp}.log"
     
-    try:
-        if args.dry_run:
-            print("DRY RUN MODE - No files will be uploaded")
+    with prevent_sleep():
+        try:
+            if args.dry_run:
+                print("DRY RUN MODE - No files will be uploaded")
 
-        print(f"Lightroom S3 Sync")
-        print(f"Source: {args.source_path}")
-        print(f"S3 Bucket: s3://{args.s3_bucket}/{args.s3_prefix}")
-        print(f"Log file: {log_file}")
-        print("-" * 50)
-        
-        # Run the backup verification process
-        stats = sync_to_s3(
-            args.source_path, args.s3_bucket, args.s3_prefix, log_file,
-            max_workers=args.threads, batch_size=args.batch_size, dry_run=args.dry_run
-        )
-        
-        # Print summary to console
-        print(f"\n===== SUMMARY =====")
-        print(f"Files scanned: {stats.total_files_scanned:,}")
-        print(f"Already in S3: {stats.files_already_in_s3:,}")
-        print(f"Uploaded to S3: {stats.files_uploaded_to_s3:,}")
-        print(f"Upload failures: {stats.upload_failures:,}")
-        print(f"Scan errors: {stats.scan_errors:,}")
-        print(f"Data uploaded: {format_bytes(stats.total_bytes_uploaded)}")
-        
-        if args.dry_run:
-            print("\n*** DRY RUN COMPLETED - No files were actually uploaded ***")
-        
-        print(f"\nDetailed log: {log_file}")
-        
-        # Exit with error code if there were failures
-        if stats.upload_failures > 0 or stats.scan_errors > 0:
-            print(f"\nWarning: {stats.upload_failures + stats.scan_errors} errors occurred during processing")
+            print("Lightroom S3 Sync")
+            print(f"Source: {args.source_path}")
+            print(f"S3 Bucket: s3://{args.s3_bucket}/{args.s3_prefix}")
+            print(f"Log file: {log_file}")
+            print("-" * 50)
+
+            stats = sync_to_s3(
+                args.source_path, args.s3_bucket, args.s3_prefix, log_file,
+                max_workers=args.threads, batch_size=args.batch_size,
+                dry_run=args.dry_run, debug=args.debug,
+                endpoint_url=args.endpoint_url,
+                exclude_patterns=args.exclude
+            )
+
+            print(f"\n===== SUMMARY =====")
+            print(f"Files scanned: {stats.total_files_scanned:,}")
+            print(f"Already in S3: {stats.files_already_in_s3:,}")
+            print(f"Uploaded to S3: {stats.files_uploaded_to_s3:,}")
+            print(f"Upload failures: {stats.upload_failures:,}")
+            print(f"Scan errors: {stats.scan_errors:,}")
+            print(f"Data uploaded: {format_bytes(stats.total_bytes_uploaded)}")
+
+            if args.dry_run:
+                print("\n*** DRY RUN COMPLETED - No files were actually uploaded ***")
+
+            print(f"\nDetailed log: {log_file}")
+
+            if stats.upload_failures > 0 or stats.scan_errors > 0:
+                print(f"\nWarning: {stats.upload_failures + stats.scan_errors} errors occurred during processing")
+                sys.exit(1)
+
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user")
+            sys.exit(130)
+        except Exception as e:
+            logging.error(f"Fatal error: {e}")
+            print(f"Fatal error: {e}")
             sys.exit(1)
-        
-    except KeyboardInterrupt:
-        print("\nOperation cancelled by user")
-        sys.exit(130)
-    except Exception as e:
-        logging.error(f"Fatal error: {e}")
-        print(f"Fatal error: {e}")
-        sys.exit(1)
-    finally:
-        # Allow Windows to sleep again after script finishes
-        if sys.platform == "win32":
-            try:
-                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
-            except Exception:
-                pass
 
 if __name__ == "__main__":
     main()
