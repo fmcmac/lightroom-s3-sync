@@ -39,6 +39,9 @@ uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom --threads 8 --batch-
 # Mirror local to S3 — upload new files and delete S3 objects no longer present locally
 uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom --delete
 
+# Ignore small size differences from metadata-only changes (e.g. DNG software tags)
+uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom --size-tolerance 64
+
 # Use an S3-compatible endpoint (MinIO, Backblaze B2, etc.)
 uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom \
   --endpoint-url http://localhost:9000 --s3-bucket mybucket
@@ -56,6 +59,7 @@ uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom \
 | `--exclude` | *(none)* | Glob pattern to exclude files (repeatable) |
 | `--log-file` | auto-timestamped | Custom log file path |
 | `--endpoint-url` | *(none)* | Custom S3 endpoint URL |
+| `--size-tolerance` | `0` | Ignore size differences up to this many bytes |
 | `--delete` | off | Delete S3 objects not present locally |
 | `--dry-run` | off | Show what would be uploaded/deleted without acting |
 | `--debug` | off | Enable debug logging to console |
@@ -64,8 +68,8 @@ uv run lightroom-s3-sync --source-path ~/Pictures/Lightroom \
 
 1. Bulk-lists all existing S3 objects under the prefix to prime a local cache (avoids per-file HEAD requests)
 2. Recursively scans the source directory for all files (respecting `--exclude` patterns)
-3. For each file, checks if a corresponding S3 object already exists and has the same size
-4. Uploads any missing or size-mismatched files, with exponential-backoff retry (3 attempts)
+3. For each file, checks if a corresponding S3 object already exists with an equal or larger size (within `--size-tolerance`)
+4. Uploads missing files or files where the local copy is larger, with exponential-backoff retry (3 attempts)
 5. With `--delete`, removes S3 objects that no longer exist locally
 6. Files are processed in batches across a thread pool for throughput
 7. Produces a timestamped log file with full details and a rich progress bar on the console
