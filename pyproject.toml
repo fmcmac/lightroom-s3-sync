@@ -3,7 +3,10 @@ name = "lightroom-s3-sync"
 version = "0.1.0"
 description = "Sync a local Lightroom photo directory to an S3 bucket"
 requires-python = ">=3.13"
-dependencies = ["boto3"]
+dependencies = ["boto3", "rich"]
+
+[dependency-groups]
+dev = ["pytest", "moto[s3]"]
 
 [build-system]
 requires = ["hatchling"]
@@ -12,6 +15,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 only-include = ["lightrooms3sync.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
 
 [project.scripts]
 lightroom-s3-sync = "lightrooms3sync:main"

@@ -32,16 +32,23 @@ Requires AWS credentials configured via `aws configure` or environment variables
 
 All code lives in `lightrooms3sync.py` with four main classes:
 
-- **S3BackupManager** — S3 client wrapper with connection pooling, LRU-cached existence checks, retry-based uploads, and a thread-safe in-memory cache
-- **FileScanner** — Recursive `os.walk`-based file discovery that produces `(absolute_path, relative_path)` tuples
-- **BackupVerifier** — Orchestrates batch file processing: checks S3 existence then uploads missing files (or simulates in dry-run mode)
-- **ProgressTracker** — Thread-safe progress display with ETA calculation
+- **S3BackupManager** — S3 client wrapper with connection pooling, bulk `list_objects_v2` cache priming, thread-safe in-memory cache, retry-based uploads, and object deletion
+- **FileScanner** — Recursive `os.walk`-based file discovery with glob-based exclude patterns
+- **BackupVerifier** — Orchestrates batch file processing: checks S3 existence + size, uploads missing/mismatched files (or simulates in dry-run mode)
 
-The `sync_to_s3()` function wires these together: scan files, split into batches, process batches in parallel via `ThreadPoolExecutor`, aggregate `BackupStats` results.
+The `sync_to_s3()` function wires these together: prime cache, scan files, split into batches, process in parallel via `ThreadPoolExecutor`, optionally delete orphaned S3 objects, aggregate `BackupStats` results. Progress is displayed via `rich`.
+
+## Testing
+
+```bash
+uv run pytest
+```
+
+Tests use `moto` to mock S3 — no AWS credentials needed.
 
 ## Key Details
 
 - S3 keys are formed as `{s3_prefix}/{relative_path}` with backslashes converted to forward slashes
 - Uploads use exponential backoff retry (3 attempts)
+- File sync checks both existence and size (re-uploads on mismatch)
 - Managed with `uv`; dependencies defined in `pyproject.toml`, locked in `uv.lock`
-- No tests exist currently

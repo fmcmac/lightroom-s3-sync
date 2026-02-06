@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import threading
 import fnmatch
 import subprocess
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
 
 @contextmanager
 def prevent_sleep():
@@ -58,7 +59,9 @@ class BackupStats:
     upload_failures: int = 0
     scan_errors: int = 0
     total_bytes_uploaded: int = 0
-    
+    files_deleted: int = 0
+    delete_failures: int = 0
+
     def __add__(self, other):
         """Allow adding stats objects together."""
         return BackupStats(
@@ -67,7 +70,9 @@ class BackupStats:
             files_uploaded_to_s3=self.files_uploaded_to_s3 + other.files_uploaded_to_s3,
             upload_failures=self.upload_failures + other.upload_failures,
             scan_errors=self.scan_errors + other.scan_errors,
-            total_bytes_uploaded=self.total_bytes_uploaded + other.total_bytes_uploaded
+            total_bytes_uploaded=self.total_bytes_uploaded + other.total_bytes_uploaded,
+            files_deleted=self.files_deleted + other.files_deleted,
+            delete_failures=self.delete_failures + other.delete_failures
         )
 
 class S3BackupManager:
@@ -186,7 +191,7 @@ class S3BackupManager:
                 # Update cache
                 cache_key = f"{bucket}/{key}"
                 with self._cache_lock:
-                    self._s3_cache[cache_key] = True
+                    self._s3_cache[cache_key] = (True, file_size)
                 
                 logging.debug(f"Successfully uploaded {src_file.name} ({file_size:,} bytes) to s3://{bucket}/{key}")
                 return True, file_size
@@ -199,6 +204,53 @@ class S3BackupManager:
         
         return False, 0
     
+    def list_objects(self, bucket: str, prefix: str) -> List[str]:
+        """List all object keys under a prefix."""
+        keys = []
+        paginator = self.s3_client.get_paginator('list_objects_v2')
+
+        try:
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    keys.append(obj['Key'])
+        except Exception as e:
+            logging.error(f"Error listing objects under s3://{bucket}/{prefix}: {e}")
+
+        return keys
+
+    def delete_object(self, bucket: str, key: str) -> bool:
+        """Delete an object from S3."""
+        try:
+            self.s3_client.delete_object(Bucket=bucket, Key=key)
+            with self._cache_lock:
+                cache_key = f"{bucket}/{key}"
+                self._s3_cache.pop(cache_key, None)
+            return True
+        except Exception as e:
+            logging.error(f"Failed to delete s3://{bucket}/{key}: {e}")
+            return False
+
+    def load_prefix_cache(self, bucket: str, prefix: str) -> int:
+        """Bulk-load all S3 object keys and sizes under a prefix into the cache.
+
+        Returns the number of objects found.
+        """
+        count = 0
+        paginator = self.s3_client.get_paginator('list_objects_v2')
+
+        try:
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    cache_key = f"{bucket}/{obj['Key']}"
+                    with self._cache_lock:
+                        self._s3_cache[cache_key] = (True, obj['Size'])
+                    count += 1
+        except Exception as e:
+            logging.warning(f"Error listing objects under s3://{bucket}/{prefix}: {e}")
+
+        logging.info(f"Loaded {count:,} existing S3 objects into cache")
+        return count
+
     def batch_check_exists(self, bucket: str, keys: List[str]) -> Dict[str, Tuple[bool, int]]:
         """Batch check existence of multiple S3 objects.
 
@@ -335,43 +387,16 @@ class BackupVerifier:
         
         return stats
 
-class ProgressTracker:
-    """Track and display progress of the backup verification process."""
-    
-    def __init__(self, total_files: int):
-        self.total_files = total_files
-        self.processed_files = 0
-        self.start_time = time.time()
-        self.lock = threading.Lock()
-        self.last_update = 0
-    
-    def update(self, increment: int = 1):
-        """Update progress counter."""
-        with self.lock:
-            self.processed_files += increment
-            
-            # Only print progress every second to avoid spam
-            now = time.time()
-            if now - self.last_update >= 1.0 or self.processed_files == self.total_files:
-                self._print_progress()
-                self.last_update = now
-    
-    def _print_progress(self):
-        """Print current progress."""
-        if self.total_files == 0:
-            return
-        
-        progress = (self.processed_files / self.total_files) * 100
-        elapsed = time.time() - self.start_time
-        
-        if self.processed_files > 0:
-            eta = (elapsed / self.processed_files) * (self.total_files - self.processed_files)
-            eta_str = f", ETA: {eta/60:.1f}m" if eta > 60 else f", ETA: {eta:.0f}s"
-        else:
-            eta_str = ""
-        
-        print(f"\rProgress: {self.processed_files:,}/{self.total_files:,} "
-              f"({progress:.1f}%) - Elapsed: {elapsed/60:.1f}m{eta_str}", end="", flush=True)
+def create_progress() -> Progress:
+    """Create a rich progress bar for file processing."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    )
 
 def format_bytes(bytes_count: int) -> str:
     """Format bytes as human readable string."""
@@ -385,7 +410,8 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
                log_file: str, max_workers: int = 4, batch_size: int = 100,
                dry_run: bool = False, debug: bool = False,
                endpoint_url: str = None,
-               exclude_patterns: List[str] = None) -> BackupStats:
+               exclude_patterns: List[str] = None,
+               delete: bool = False) -> BackupStats:
     """
     Sync a local directory to S3, uploading any files not already present.
 
@@ -452,7 +478,10 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
     # Validate S3 bucket exists and is accessible
     if not s3_manager.validate_bucket(s3_bucket):
         raise ValueError(f"S3 bucket validation failed: {s3_bucket}")
-    
+
+    # Bulk-load existing S3 objects into cache to avoid per-file HEAD requests
+    s3_manager.load_prefix_cache(s3_bucket, s3_prefix)
+
     scanner = FileScanner(source_root, exclude_patterns=exclude_patterns)
     verifier = BackupVerifier(s3_manager, dry_run)
     
@@ -463,40 +492,64 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
         logging.warning("No files found to process")
         return BackupStats()
     
-    # Initialize progress tracking
-    progress_tracker = ProgressTracker(len(all_files))
     total_stats = BackupStats()
-    
+
     # Process files in batches with parallel execution
     logging.info(f"Processing {len(all_files):,} files in batches of {batch_size}...")
-    
-    for i in range(0, len(all_files), batch_size):
-        batch = all_files[i:i + batch_size]
-        
-        # Process batch in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Split batch into smaller chunks for each worker
-            chunk_size = max(1, len(batch) // max_workers)
-            chunks = [batch[j:j + chunk_size] for j in range(0, len(batch), chunk_size)]
-            
-            future_to_chunk = {
-                executor.submit(verifier.process_files_batch, chunk, s3_bucket, s3_prefix): chunk
-                for chunk in chunks if chunk
-            }
-            
-            for future in as_completed(future_to_chunk):
-                try:
-                    batch_stats = future.result()
-                    total_stats = total_stats + batch_stats
-                    progress_tracker.update(batch_stats.total_files_scanned)
-                except Exception as e:
-                    chunk = future_to_chunk[future]
-                    logging.error(f"Error processing batch of {len(chunk)} files: {e}")
-                    total_stats.scan_errors += len(chunk)
-                    progress_tracker.update(len(chunk))
-    
-    print()  # New line after progress
-    
+
+    with create_progress() as progress:
+        task = progress.add_task("Syncing", total=len(all_files))
+
+        for i in range(0, len(all_files), batch_size):
+            batch = all_files[i:i + batch_size]
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                chunk_size = max(1, len(batch) // max_workers)
+                chunks = [batch[j:j + chunk_size] for j in range(0, len(batch), chunk_size)]
+
+                future_to_chunk = {
+                    executor.submit(verifier.process_files_batch, chunk, s3_bucket, s3_prefix): chunk
+                    for chunk in chunks if chunk
+                }
+
+                for future in as_completed(future_to_chunk):
+                    try:
+                        batch_stats = future.result()
+                        total_stats = total_stats + batch_stats
+                        progress.update(task, advance=batch_stats.total_files_scanned)
+                    except Exception as e:
+                        chunk = future_to_chunk[future]
+                        logging.error(f"Error processing batch of {len(chunk)} files: {e}")
+                        total_stats.scan_errors += len(chunk)
+                        progress.update(task, advance=len(chunk))
+
+    # Delete orphaned S3 objects if requested
+    if delete:
+        logging.info("Checking for orphaned S3 objects to delete...")
+        local_keys = set()
+        for _, relative_path in all_files:
+            s3_relative_path = relative_path.replace('\\', '/')
+            s3_key = f"{s3_prefix}/{s3_relative_path}" if s3_prefix else s3_relative_path
+            local_keys.add(s3_key)
+
+        s3_keys = s3_manager.list_objects(s3_bucket, s3_prefix)
+        orphaned = [k for k in s3_keys if k not in local_keys]
+
+        if orphaned:
+            logging.info(f"Found {len(orphaned):,} orphaned S3 objects")
+            for key in orphaned:
+                if dry_run:
+                    logging.info(f"[DRY RUN] Would delete: {key}")
+                    total_stats.files_deleted += 1
+                else:
+                    logging.info(f"Deleting: {key}")
+                    if s3_manager.delete_object(s3_bucket, key):
+                        total_stats.files_deleted += 1
+                    else:
+                        total_stats.delete_failures += 1
+        else:
+            logging.info("No orphaned S3 objects found")
+
     # Log final statistics
     logging.info("===== Sync Summary =====")
     logging.info(f"Total files scanned: {total_stats.total_files_scanned:,}")
@@ -505,6 +558,9 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
     logging.info(f"Upload failures: {total_stats.upload_failures:,}")
     logging.info(f"Scan errors: {total_stats.scan_errors:,}")
     logging.info(f"Total bytes uploaded: {format_bytes(total_stats.total_bytes_uploaded)}")
+    if delete:
+        logging.info(f"Files deleted from S3: {total_stats.files_deleted:,}")
+        logging.info(f"Delete failures: {total_stats.delete_failures:,}")
     
     if dry_run:
         logging.info("*** This was a DRY RUN - no files were actually uploaded ***")
@@ -535,6 +591,8 @@ def main():
                        help='Log file path (default: lightroom_s3_sync_<timestamp>.log)')
     parser.add_argument('--endpoint-url', type=str, default=None,
                        help='Custom S3 endpoint URL for S3-compatible services (e.g. MinIO, Backblaze B2)')
+    parser.add_argument('--delete', action='store_true',
+                       help='Delete S3 objects that no longer exist locally (makes S3 mirror local)')
     parser.add_argument('--dry-run', action='store_true',
                        help='Perform a dry run without uploading files (shows what would be uploaded)')
     parser.add_argument('--debug', action='store_true',
@@ -564,7 +622,8 @@ def main():
                 max_workers=args.threads, batch_size=args.batch_size,
                 dry_run=args.dry_run, debug=args.debug,
                 endpoint_url=args.endpoint_url,
-                exclude_patterns=args.exclude
+                exclude_patterns=args.exclude,
+                delete=args.delete
             )
 
             print(f"\n===== SUMMARY =====")
@@ -574,14 +633,19 @@ def main():
             print(f"Upload failures: {stats.upload_failures:,}")
             print(f"Scan errors: {stats.scan_errors:,}")
             print(f"Data uploaded: {format_bytes(stats.total_bytes_uploaded)}")
+            if args.delete:
+                print(f"Deleted from S3: {stats.files_deleted:,}")
+                if stats.delete_failures:
+                    print(f"Delete failures: {stats.delete_failures:,}")
 
             if args.dry_run:
                 print("\n*** DRY RUN COMPLETED - No files were actually uploaded ***")
 
             print(f"\nDetailed log: {log_file}")
 
-            if stats.upload_failures > 0 or stats.scan_errors > 0:
-                print(f"\nWarning: {stats.upload_failures + stats.scan_errors} errors occurred during processing")
+            total_errors = stats.upload_failures + stats.scan_errors + stats.delete_failures
+            if total_errors > 0:
+                print(f"\nWarning: {total_errors} errors occurred during processing")
                 sys.exit(1)
 
         except KeyboardInterrupt:
