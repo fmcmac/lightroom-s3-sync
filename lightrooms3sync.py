@@ -325,10 +325,12 @@ class FileScanner:
 
 class BackupVerifier:
     """Handles backup verification and upload operations."""
-    
-    def __init__(self, s3_manager: S3BackupManager, dry_run: bool = False):
+
+    def __init__(self, s3_manager: S3BackupManager, dry_run: bool = False,
+                 size_tolerance: int = 0):
         self.s3_manager = s3_manager
         self.dry_run = dry_run
+        self.size_tolerance = size_tolerance
     
     def process_files_batch(self, files_batch: List[Tuple[Path, str]], bucket: str, 
                            s3_prefix: str) -> BackupStats:
@@ -359,12 +361,13 @@ class BackupVerifier:
                 s3_exists, s3_size = s3_exists_map.get(s3_key, (False, 0))
                 local_size = file_path.stat().st_size
 
-                if s3_exists and s3_size == local_size:
+                size_diff = abs(local_size - s3_size)
+                if s3_exists and (s3_size >= local_size or size_diff <= self.size_tolerance):
                     stats.files_already_in_s3 += 1
                     logging.debug(f"File already in S3: {relative_path}")
                 else:
                     if s3_exists:
-                        reason = f"size mismatch (local={local_size}, s3={s3_size})"
+                        reason = f"local file larger (local={local_size}, s3={s3_size})"
                     else:
                         reason = "missing from S3"
 
@@ -411,7 +414,8 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
                dry_run: bool = False, debug: bool = False,
                endpoint_url: str = None,
                exclude_patterns: List[str] = None,
-               delete: bool = False) -> BackupStats:
+               delete: bool = False,
+               size_tolerance: int = 0) -> BackupStats:
     """
     Sync a local directory to S3, uploading any files not already present.
 
@@ -483,7 +487,7 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
     s3_manager.load_prefix_cache(s3_bucket, s3_prefix)
 
     scanner = FileScanner(source_root, exclude_patterns=exclude_patterns)
-    verifier = BackupVerifier(s3_manager, dry_run)
+    verifier = BackupVerifier(s3_manager, dry_run, size_tolerance=size_tolerance)
     
     # Scan all files
     all_files = scanner.get_all_files()
@@ -591,6 +595,8 @@ def main():
                        help='Log file path (default: lightroom_s3_sync_<timestamp>.log)')
     parser.add_argument('--endpoint-url', type=str, default=None,
                        help='Custom S3 endpoint URL for S3-compatible services (e.g. MinIO, Backblaze B2)')
+    parser.add_argument('--size-tolerance', type=int, default=0, metavar='BYTES',
+                       help='Ignore size differences up to this many bytes (useful for metadata-only changes)')
     parser.add_argument('--delete', action='store_true',
                        help='Delete S3 objects that no longer exist locally (makes S3 mirror local)')
     parser.add_argument('--dry-run', action='store_true',
@@ -623,7 +629,8 @@ def main():
                 dry_run=args.dry_run, debug=args.debug,
                 endpoint_url=args.endpoint_url,
                 exclude_patterns=args.exclude,
-                delete=args.delete
+                delete=args.delete,
+                size_tolerance=args.size_tolerance
             )
 
             print(f"\n===== SUMMARY =====")

@@ -221,7 +221,7 @@ class TestBackupVerifier:
         assert stats.files_already_in_s3 == 1
         assert stats.files_uploaded_to_s3 == 0
 
-    def test_reuploads_size_mismatch(self, tmp_path):
+    def test_reuploads_when_local_larger(self, tmp_path):
         s3, mgr = self._setup(tmp_path)
 
         f = tmp_path / "photo.jpg"
@@ -234,6 +234,34 @@ class TestBackupVerifier:
         )
         assert stats.files_uploaded_to_s3 == 1
         assert stats.files_already_in_s3 == 0
+
+    def test_skips_when_s3_larger(self, tmp_path):
+        s3, mgr = self._setup(tmp_path)
+
+        f = tmp_path / "photo.jpg"
+        f.write_bytes(b"short")
+        s3.put_object(Bucket=BUCKET, Key="Photos/photo.jpg", Body=b"longer content in s3")
+
+        verifier = BackupVerifier(mgr, dry_run=False)
+        stats = verifier.process_files_batch(
+            [(f, "photo.jpg")], BUCKET, PREFIX
+        )
+        assert stats.files_already_in_s3 == 1
+        assert stats.files_uploaded_to_s3 == 0
+
+    def test_skips_within_size_tolerance(self, tmp_path):
+        s3, mgr = self._setup(tmp_path)
+
+        f = tmp_path / "photo.dng"
+        f.write_bytes(b"local content!!")  # 15 bytes
+        s3.put_object(Bucket=BUCKET, Key="Photos/photo.dng", Body=b"s3 content")  # 10 bytes
+
+        verifier = BackupVerifier(mgr, dry_run=False, size_tolerance=10)
+        stats = verifier.process_files_batch(
+            [(f, "photo.dng")], BUCKET, PREFIX
+        )
+        assert stats.files_already_in_s3 == 1
+        assert stats.files_uploaded_to_s3 == 0
 
     def test_dry_run_no_upload(self, tmp_path):
         _, mgr = self._setup(tmp_path)
