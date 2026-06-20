@@ -10,6 +10,7 @@ import os
 import logging
 import sys
 from pathlib import Path
+import hashlib
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -17,13 +18,52 @@ from datetime import datetime
 import argparse
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import time
 from dataclasses import dataclass
 import threading
 import fnmatch
 import subprocess
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+
+S3ObjectInfo = Tuple[bool, int, Optional[str]]
+
+
+def normalize_s3_prefix(prefix: str) -> str:
+    """Normalize a user-provided S3 prefix for object key construction."""
+    return prefix.strip("/") if prefix else ""
+
+
+def s3_listing_prefix(prefix: str) -> str:
+    """Return a prefix that only lists objects inside the configured folder."""
+    normalized = normalize_s3_prefix(prefix)
+    return f"{normalized}/" if normalized else ""
+
+
+def make_s3_key(s3_prefix: str, relative_path: str) -> str:
+    """Build a normalized S3 key for a local relative path."""
+    s3_relative_path = relative_path.replace("\\", "/")
+    normalized_prefix = normalize_s3_prefix(s3_prefix)
+    return f"{normalized_prefix}/{s3_relative_path}" if normalized_prefix else s3_relative_path
+
+
+def normalize_etag(etag: Optional[str]) -> Optional[str]:
+    """Return a comparable simple-object ETag, or None for multipart/unknown ETags."""
+    if not etag:
+        return None
+    normalized = etag.strip('"')
+    if "-" in normalized:
+        return None
+    return normalized.lower()
+
+
+def file_md5(path: Path) -> str:
+    """Compute an MD5 digest for comparing with simple S3 ETags."""
+    digest = hashlib.md5()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 @contextmanager
 def prevent_sleep():
@@ -80,7 +120,7 @@ class S3BackupManager:
 
     def __init__(self, max_pool_connections: int = 50, endpoint_url: str = None):
         self.s3_client = None
-        self._s3_cache: Dict[str, bool] = {}
+        self._s3_cache: Dict[str, S3ObjectInfo] = {}
         self._cache_lock = threading.Lock()
         self.max_pool_connections = max_pool_connections
         self.endpoint_url = endpoint_url
@@ -93,11 +133,7 @@ class S3BackupManager:
             self.s3_client = boto3.client(
                 's3', config=config, endpoint_url=self.endpoint_url
             )
-            
-            # Test basic connectivity
-            response = self.s3_client.list_buckets()
             logging.info("S3 client initialized successfully")
-            logging.debug(f"Found {len(response.get('Buckets', []))} accessible buckets")
             
         except NoCredentialsError:
             logging.error("AWS credentials not found. Please configure your credentials.")
@@ -146,11 +182,11 @@ class S3BackupManager:
             logging.error(f"Error type: {type(e).__name__}")
             return False
     
-    def file_exists(self, bucket: str, key: str) -> Tuple[bool, int]:
+    def object_info(self, bucket: str, key: str) -> S3ObjectInfo:
         """Check if file exists in S3 with thread-safe caching.
 
         Returns:
-            (exists, size) — size is the S3 object size in bytes, or 0 if not found.
+            (exists, size, etag) — etag is comparable only for simple S3 objects.
         """
         cache_key = f"{bucket}/{key}"
 
@@ -160,18 +196,27 @@ class S3BackupManager:
 
         try:
             response = self.s3_client.head_object(Bucket=bucket, Key=key)
-            result = (True, response['ContentLength'])
+            result = (
+                True,
+                response['ContentLength'],
+                normalize_etag(response.get('ETag')),
+            )
         except ClientError as e:
             if e.response['Error']['Code'] == "404":
-                result = (False, 0)
+                result = (False, 0, None)
             else:
                 logging.warning(f"Error checking S3 object {key}: {e}")
-                result = (False, 0)
+                result = (False, 0, None)
 
         with self._cache_lock:
             self._s3_cache[cache_key] = result
 
         return result
+
+    def file_exists(self, bucket: str, key: str) -> Tuple[bool, int]:
+        """Check if file exists in S3 and return its size."""
+        exists, size, _ = self.object_info(bucket, key)
+        return exists, size
     
     def upload_file(self, bucket: str, key: str, src_file: Path) -> Tuple[bool, int]:
         """Upload file to S3 with retry logic. Returns (success, bytes_uploaded)."""
@@ -191,7 +236,7 @@ class S3BackupManager:
                 # Update cache
                 cache_key = f"{bucket}/{key}"
                 with self._cache_lock:
-                    self._s3_cache[cache_key] = (True, file_size)
+                    self._s3_cache[cache_key] = (True, file_size, file_md5(src_file))
                 
                 logging.debug(f"Successfully uploaded {src_file.name} ({file_size:,} bytes) to s3://{bucket}/{key}")
                 return True, file_size
@@ -209,12 +254,14 @@ class S3BackupManager:
         keys = []
         paginator = self.s3_client.get_paginator('list_objects_v2')
 
+        list_prefix = s3_listing_prefix(prefix)
+
         try:
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix):
                 for obj in page.get('Contents', []):
                     keys.append(obj['Key'])
         except Exception as e:
-            logging.error(f"Error listing objects under s3://{bucket}/{prefix}: {e}")
+            logging.error(f"Error listing objects under s3://{bucket}/{list_prefix}: {e}")
 
         return keys
 
@@ -238,24 +285,30 @@ class S3BackupManager:
         count = 0
         paginator = self.s3_client.get_paginator('list_objects_v2')
 
+        list_prefix = s3_listing_prefix(prefix)
+
         try:
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix):
                 for obj in page.get('Contents', []):
                     cache_key = f"{bucket}/{obj['Key']}"
                     with self._cache_lock:
-                        self._s3_cache[cache_key] = (True, obj['Size'])
+                        self._s3_cache[cache_key] = (
+                            True,
+                            obj['Size'],
+                            normalize_etag(obj.get('ETag')),
+                        )
                     count += 1
         except Exception as e:
-            logging.warning(f"Error listing objects under s3://{bucket}/{prefix}: {e}")
+            logging.warning(f"Error listing objects under s3://{bucket}/{list_prefix}: {e}")
 
         logging.info(f"Loaded {count:,} existing S3 objects into cache")
         return count
 
-    def batch_check_exists(self, bucket: str, keys: List[str]) -> Dict[str, Tuple[bool, int]]:
+    def batch_check_exists(self, bucket: str, keys: List[str]) -> Dict[str, S3ObjectInfo]:
         """Batch check existence of multiple S3 objects.
 
         Returns:
-            Dict mapping key -> (exists, size_in_bytes).
+            Dict mapping key -> (exists, size_in_bytes, etag).
         """
         results = {}
 
@@ -271,7 +324,7 @@ class S3BackupManager:
 
         # Check uncached keys
         for key in uncached_keys:
-            results[key] = self.file_exists(bucket, key)
+            results[key] = self.object_info(bucket, key)
 
         return results
 
@@ -282,9 +335,13 @@ class FileScanner:
         self.source_root = source_root
         self.exclude_patterns = exclude_patterns or []
 
-    def _is_excluded(self, filename: str) -> bool:
-        """Check if a filename matches any exclude pattern."""
-        return any(fnmatch.fnmatch(filename, pat) for pat in self.exclude_patterns)
+    def _is_excluded(self, path: str) -> bool:
+        """Check if a file or directory path matches any exclude pattern."""
+        name = Path(path).name
+        return any(
+            fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(name, pat)
+            for pat in self.exclude_patterns
+        )
 
     def scan_directory(self, directory: Path) -> List[Tuple[Path, str]]:
         """Scan directory recursively and return list of (file_path, relative_path) tuples."""
@@ -297,15 +354,21 @@ class FileScanner:
 
             for root, dirs, filenames in os.walk(directory):
                 root_path = Path(root)
+                dirs[:] = [
+                    dirname for dirname in dirs
+                    if not self._is_excluded(
+                        str((root_path / dirname).relative_to(self.source_root))
+                    )
+                ]
 
                 for filename in filenames:
-                    if self._is_excluded(filename):
-                        logging.debug(f"Excluded: {filename}")
-                        continue
                     try:
                         file_path = root_path / filename
+                        relative_path = file_path.relative_to(self.source_root)
+                        if self._is_excluded(str(relative_path)):
+                            logging.debug(f"Excluded: {relative_path}")
+                            continue
                         if file_path.is_file():
-                            relative_path = file_path.relative_to(self.source_root)
                             files.append((file_path, str(relative_path)))
                     except Exception as e:
                         logging.warning(f"Error processing file {filename} in {root}: {e}")
@@ -327,10 +390,11 @@ class BackupVerifier:
     """Handles backup verification and upload operations."""
 
     def __init__(self, s3_manager: S3BackupManager, dry_run: bool = False,
-                 size_tolerance: int = 0):
+                 size_tolerance: int = 0, verify_checksum: bool = False):
         self.s3_manager = s3_manager
         self.dry_run = dry_run
         self.size_tolerance = size_tolerance
+        self.verify_checksum = verify_checksum
     
     def process_files_batch(self, files_batch: List[Tuple[Path, str]], bucket: str, 
                            s3_prefix: str) -> BackupStats:
@@ -342,9 +406,7 @@ class BackupVerifier:
         file_mapping = {}
         
         for file_path, relative_path in files_batch:
-            # Convert Windows path separators to forward slashes for S3
-            s3_relative_path = relative_path.replace('\\', '/')
-            s3_key = f"{s3_prefix}/{s3_relative_path}" if s3_prefix else s3_relative_path
+            s3_key = make_s3_key(s3_prefix, relative_path)
             s3_keys.append(s3_key)
             file_mapping[s3_key] = (file_path, relative_path)
         
@@ -358,19 +420,31 @@ class BackupVerifier:
             file_path, relative_path = file_mapping[s3_key]
 
             try:
-                s3_exists, s3_size = s3_exists_map.get(s3_key, (False, 0))
+                s3_exists, s3_size, s3_etag = s3_exists_map.get(s3_key, (False, 0, None))
                 local_size = file_path.stat().st_size
 
                 size_diff = abs(local_size - s3_size)
-                if s3_exists and (s3_size >= local_size or size_diff <= self.size_tolerance):
+                if not s3_exists:
+                    needs_upload = True
+                    reason = "missing from S3"
+                elif size_diff > self.size_tolerance:
+                    needs_upload = True
+                    reason = (
+                        f"size changed (local={local_size}, s3={s3_size}, "
+                        f"diff={size_diff})"
+                    )
+                elif size_diff > 0:
+                    needs_upload = False
+                elif self.verify_checksum and s3_etag and file_md5(file_path) != s3_etag:
+                    needs_upload = True
+                    reason = "content changed (same size, ETag mismatch)"
+                else:
+                    needs_upload = False
+
+                if not needs_upload:
                     stats.files_already_in_s3 += 1
                     logging.debug(f"File already in S3: {relative_path}")
                 else:
-                    if s3_exists:
-                        reason = f"local file larger (local={local_size}, s3={s3_size})"
-                    else:
-                        reason = "missing from S3"
-
                     if self.dry_run:
                         logging.info(f"[DRY RUN] Would upload ({reason}): {relative_path}")
                         stats.files_uploaded_to_s3 += 1
@@ -409,13 +483,19 @@ def format_bytes(bytes_count: int) -> str:
         bytes_count /= 1024.0
     return f"{bytes_count:.1f} PB"
 
+def silence_dependency_debug_logs() -> None:
+    """Keep verbose SDK request logs from writing credentials to sync logs."""
+    for logger_name in ("boto3", "botocore", "s3transfer", "urllib3"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
 def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
                log_file: str, max_workers: int = 4, batch_size: int = 100,
                dry_run: bool = False, debug: bool = False,
                endpoint_url: str = None,
                exclude_patterns: List[str] = None,
                delete: bool = False,
-               size_tolerance: int = 0) -> BackupStats:
+               size_tolerance: int = 0,
+               verify_checksum: bool = False) -> BackupStats:
     """
     Sync a local directory to S3, uploading any files not already present.
 
@@ -457,6 +537,7 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+    silence_dependency_debug_logs()
     
     if dry_run:
         logging.info("*** DRY RUN MODE - No files will be uploaded ***")
@@ -464,6 +545,7 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
     logging.info("Starting sync...")
     logging.info(f"Source: {source_path}")
     logging.info(f"S3 Bucket: {s3_bucket}")
+    s3_prefix = normalize_s3_prefix(s3_prefix)
     logging.info(f"S3 Prefix: {s3_prefix}")
     logging.info(f"Max Workers: {max_workers}")
     logging.info(f"Batch Size: {batch_size}")
@@ -475,8 +557,10 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
         raise ValueError(f"Source directory does not exist: {source_path}")
     
     # Initialize components
+    # boto3's managed upload may use several HTTP connections per worker.
     s3_manager = S3BackupManager(
-        max_pool_connections=max_workers * 2, endpoint_url=endpoint_url
+        max_pool_connections=max(50, max_workers * 10),
+        endpoint_url=endpoint_url,
     )
     
     # Validate S3 bucket exists and is accessible
@@ -487,7 +571,12 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
     s3_manager.load_prefix_cache(s3_bucket, s3_prefix)
 
     scanner = FileScanner(source_root, exclude_patterns=exclude_patterns)
-    verifier = BackupVerifier(s3_manager, dry_run, size_tolerance=size_tolerance)
+    verifier = BackupVerifier(
+        s3_manager,
+        dry_run,
+        size_tolerance=size_tolerance,
+        verify_checksum=verify_checksum,
+    )
     
     # Scan all files
     all_files = scanner.get_all_files()
@@ -532,9 +621,7 @@ def sync_to_s3(source_path: str, s3_bucket: str, s3_prefix: str,
         logging.info("Checking for orphaned S3 objects to delete...")
         local_keys = set()
         for _, relative_path in all_files:
-            s3_relative_path = relative_path.replace('\\', '/')
-            s3_key = f"{s3_prefix}/{s3_relative_path}" if s3_prefix else s3_relative_path
-            local_keys.add(s3_key)
+            local_keys.add(make_s3_key(s3_prefix, relative_path))
 
         s3_keys = s3_manager.list_objects(s3_bucket, s3_prefix)
         orphaned = [k for k in s3_keys if k not in local_keys]
@@ -597,6 +684,8 @@ def main():
                        help='Custom S3 endpoint URL for S3-compatible services (e.g. MinIO, Backblaze B2)')
     parser.add_argument('--size-tolerance', type=int, default=0, metavar='BYTES',
                        help='Ignore size differences up to this many bytes (useful for metadata-only changes)')
+    parser.add_argument('--verify-checksum', action='store_true',
+                       help='Compare same-size files against simple S3 ETags (slower; only safe when ETags are MD5 hashes)')
     parser.add_argument('--delete', action='store_true',
                        help='Delete S3 objects that no longer exist locally (makes S3 mirror local)')
     parser.add_argument('--dry-run', action='store_true',
@@ -630,7 +719,8 @@ def main():
                 endpoint_url=args.endpoint_url,
                 exclude_patterns=args.exclude,
                 delete=args.delete,
-                size_tolerance=args.size_tolerance
+                size_tolerance=args.size_tolerance,
+                verify_checksum=args.verify_checksum
             )
 
             print(f"\n===== SUMMARY =====")
@@ -665,6 +755,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

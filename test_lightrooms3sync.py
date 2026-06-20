@@ -1,4 +1,5 @@
 import os
+import logging
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,11 @@ from lightrooms3sync import (
     BackupVerifier,
     format_bytes,
     main,
+    make_s3_key,
+    normalize_s3_prefix,
+    silence_dependency_debug_logs,
+    s3_listing_prefix,
+    sync_to_s3,
 )
 
 BUCKET = "test-bucket"
@@ -79,6 +85,17 @@ class TestFileScanner:
         names = sorted(p for _, p in files)
         assert names == ["keep.png", "photo.jpg"]
 
+    def test_exclude_patterns_prune_directories(self, tmp_path):
+        (tmp_path / "photo.jpg").write_bytes(b"\xff\xd8")
+        cache = tmp_path / "Catalog Previews.lrdata"
+        cache.mkdir()
+        (cache / "preview.dat").write_bytes(b"preview")
+
+        scanner = FileScanner(tmp_path, exclude_patterns=["*.lrdata"])
+        files = scanner.get_all_files()
+        names = sorted(p for _, p in files)
+        assert names == ["photo.jpg"]
+
 
 # --- format_bytes ---
 
@@ -95,6 +112,24 @@ class TestFormatBytes:
 
     def test_gigabytes(self):
         assert format_bytes(3 * 1024**3) == "3.0 GB"
+
+
+# --- S3 key helpers ---
+
+
+class TestS3KeyHelpers:
+    def test_normalize_s3_prefix(self):
+        assert normalize_s3_prefix("/Photos/Lightroom/") == "Photos/Lightroom"
+        assert normalize_s3_prefix("") == ""
+
+    def test_s3_listing_prefix_stays_inside_folder(self):
+        assert s3_listing_prefix("Photos") == "Photos/"
+        assert s3_listing_prefix("/Photos/") == "Photos/"
+        assert s3_listing_prefix("") == ""
+
+    def test_make_s3_key(self):
+        assert make_s3_key("/Photos/", "sub\\photo.jpg") == "Photos/sub/photo.jpg"
+        assert make_s3_key("", "sub\\photo.jpg") == "sub/photo.jpg"
 
 
 # --- S3BackupManager (moto) ---
@@ -158,6 +193,7 @@ class TestS3BackupManager:
         s3 = self._create_bucket()
         s3.put_object(Bucket=BUCKET, Key="Photos/a.jpg", Body=b"a")
         s3.put_object(Bucket=BUCKET, Key="Photos/sub/b.jpg", Body=b"b")
+        s3.put_object(Bucket=BUCKET, Key="Photos-old/c.jpg", Body=b"c")
 
         mgr = S3BackupManager()
         keys = mgr.list_objects(BUCKET, "Photos")
@@ -221,6 +257,34 @@ class TestBackupVerifier:
         assert stats.files_already_in_s3 == 1
         assert stats.files_uploaded_to_s3 == 0
 
+    def test_skips_existing_same_size_by_default_when_etag_differs(self, tmp_path):
+        s3, mgr = self._setup(tmp_path)
+
+        f = tmp_path / "photo.jpg"
+        f.write_bytes(b"new-data")
+        s3.put_object(Bucket=BUCKET, Key="Photos/photo.jpg", Body=b"old-data")
+
+        verifier = BackupVerifier(mgr, dry_run=False)
+        stats = verifier.process_files_batch(
+            [(f, "photo.jpg")], BUCKET, PREFIX
+        )
+        assert stats.files_uploaded_to_s3 == 0
+        assert stats.files_already_in_s3 == 1
+
+    def test_reuploads_existing_same_size_when_checksum_verification_enabled(self, tmp_path):
+        s3, mgr = self._setup(tmp_path)
+
+        f = tmp_path / "photo.jpg"
+        f.write_bytes(b"new-data")
+        s3.put_object(Bucket=BUCKET, Key="Photos/photo.jpg", Body=b"old-data")
+
+        verifier = BackupVerifier(mgr, dry_run=False, verify_checksum=True)
+        stats = verifier.process_files_batch(
+            [(f, "photo.jpg")], BUCKET, PREFIX
+        )
+        assert stats.files_uploaded_to_s3 == 1
+        assert stats.files_already_in_s3 == 0
+
     def test_reuploads_when_local_larger(self, tmp_path):
         s3, mgr = self._setup(tmp_path)
 
@@ -235,7 +299,7 @@ class TestBackupVerifier:
         assert stats.files_uploaded_to_s3 == 1
         assert stats.files_already_in_s3 == 0
 
-    def test_skips_when_s3_larger(self, tmp_path):
+    def test_reuploads_when_s3_larger(self, tmp_path):
         s3, mgr = self._setup(tmp_path)
 
         f = tmp_path / "photo.jpg"
@@ -246,8 +310,8 @@ class TestBackupVerifier:
         stats = verifier.process_files_batch(
             [(f, "photo.jpg")], BUCKET, PREFIX
         )
-        assert stats.files_already_in_s3 == 1
-        assert stats.files_uploaded_to_s3 == 0
+        assert stats.files_already_in_s3 == 0
+        assert stats.files_uploaded_to_s3 == 1
 
     def test_skips_within_size_tolerance(self, tmp_path):
         s3, mgr = self._setup(tmp_path)
@@ -278,6 +342,42 @@ class TestBackupVerifier:
         # File should NOT actually be in S3
         exists, _ = mgr.file_exists(BUCKET, "Photos/photo.jpg")
         assert exists is False
+
+
+# --- sync_to_s3 ---
+
+
+@mock_aws
+class TestSyncToS3:
+    def test_dependency_debug_logs_are_silenced(self):
+        silence_dependency_debug_logs()
+
+        for logger_name in ("boto3", "botocore", "s3transfer", "urllib3"):
+            assert logging.getLogger(logger_name).level == logging.WARNING
+
+    def test_delete_does_not_cross_sibling_prefix(self, tmp_path):
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        s3.put_object(Bucket=BUCKET, Key="Photos/old.jpg", Body=b"old")
+        s3.put_object(Bucket=BUCKET, Key="Photos-old/keep.jpg", Body=b"keep")
+
+        (tmp_path / "current.jpg").write_bytes(b"current")
+
+        stats = sync_to_s3(
+            str(tmp_path),
+            BUCKET,
+            "Photos",
+            str(tmp_path.parent / "sync.log"),
+            dry_run=False,
+            delete=True,
+        )
+
+        remaining = sorted(
+            obj["Key"]
+            for obj in s3.list_objects_v2(Bucket=BUCKET).get("Contents", [])
+        )
+        assert remaining == ["Photos-old/keep.jpg", "Photos/current.jpg"]
+        assert stats.files_deleted == 1
 
 
 # --- CLI ---
